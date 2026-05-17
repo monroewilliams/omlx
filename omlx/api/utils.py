@@ -377,24 +377,15 @@ def extract_text_content(
                 tool_content = truncate_tool_result(
                     tool_content, max_tool_result_tokens, tokenizer
                 )
-            # Preserve structured format for models with native tool calling
-            # so the chat template renders tool results in the model's native format
-            if getattr(tokenizer, "has_tool_calling", False):
-                processed_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": tool_content,
-                    }
-                )
-            else:
-                processed_messages.append(
-                    {
-                        "role": "user",  # mlx-lm expects user/assistant roles
-                        "content": f"[Tool Result ({tool_call_id})]: {tool_content}",
-                        _PRESERVE_BOUNDARY_KEY: True,
-                    }
-                )
+            # Preserve structured format so the chat template renders tool
+            # results in the model's native format (e.g. Qwen3 XML).
+            processed_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": tool_content,
+                }
+            )
             continue
 
         # Handle assistant messages with tool_calls
@@ -550,22 +541,15 @@ def extract_multimodal_content(
                 tool_content = truncate_tool_result(
                     tool_content, max_tool_result_tokens, tokenizer
                 )
-            if getattr(tokenizer, "has_tool_calling", False):
-                processed_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": tool_content,
-                    }
-                )
-            else:
-                processed_messages.append(
-                    {
-                        "role": "user",
-                        "content": f"[Tool Result ({tool_call_id})]: {tool_content}",
-                        _PRESERVE_BOUNDARY_KEY: True,
-                    }
-                )
+            # Preserve structured format so the chat template renders tool
+            # results in the model's native format (e.g. Qwen3 XML).
+            processed_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": tool_content,
+                }
+            )
             continue
 
         # Assistant with tool_calls - same as extract_text_content
