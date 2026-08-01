@@ -14,14 +14,17 @@ when memory limits are exceeded. It supports:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import gc
 import json
 import logging
+import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 if TYPE_CHECKING:
     from .model_settings import ModelSettingsManager
@@ -29,6 +32,8 @@ if TYPE_CHECKING:
 import mlx.core as mx
 
 from .engine import BaseEngine, BatchedEngine
+from .engine.distributed import DistributedEngineWrapper
+from .engine.base import GenerationOutput
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine.sts import STSEngine
@@ -52,6 +57,26 @@ from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
 
+
+def _resolve_total_layers(model_path: str) -> int:
+    """Resolve total transformer layer count from model config.json."""
+    try:
+        with open(Path(model_path) / "config.json") as f:
+            config = json.load(f)
+        for key in ("num_hidden_layers", "n_layers"):
+            if key in config:
+                return int(config[key])
+        # Some models (e.g., VLMs) nest it under a sub-component config
+        for sub_key in ("text_config", "vision_config", "config"):
+            sub = config.get(sub_key)
+            if isinstance(sub, dict) and "num_hidden_layers" in sub:
+                return int(sub["num_hidden_layers"])
+    except Exception:
+        logger.exception("Failed to resolve total layers for %s", model_path)
+    raise RuntimeError(
+        f"Could not determine total layer count for model at {model_path}. "
+        "Expected config.json with num_hidden_layers or n_layers."
+    )
 
 @dataclass
 class EngineEntry:
@@ -114,6 +139,8 @@ class EngineEntry:
     load_failed: bool = False  # Sticky until the next discovery refresh
     load_failure_message: str | None = None
     load_failure_at: float | None = None
+    is_distributed: bool = False  # True when loaded via distributed pipeline
+    shard_fraction: float = 1.0  # this rank's layers / total (distributed only)
 
 
 class EnginePool:
@@ -1038,12 +1065,31 @@ class EnginePool:
                         ),
                     )
 
-            # Now load the model
-            await self._load_engine(
-                model_id,
-                force_lm=force_lm,
-                runtime_settings=runtime_settings,
+            # --- Distributed loading decision ---
+            dist_engine = await self._try_load_distributed(
+                model_id, entry, runtime_settings,
             )
+            if dist_engine is not None:
+                return dist_engine  # type: ignore[return-value]
+
+            # Now load the model locally (fallback when distributed not available)
+            try:
+                await self._load_engine(
+                    model_id,
+                    force_lm=force_lm,
+                    runtime_settings=runtime_settings,
+                )
+            except InsufficientMemoryError:
+                # Local load failed — try distributed as a last resort
+                # (peers might have combined RAM). Always attempt regardless
+                # of load_threshold_gb; if no peers or distributed fails, the
+                # call returns None and we re-raise.
+                dist_engine2 = await self._try_load_distributed(
+                    model_id, entry, runtime_settings,
+                )
+                if dist_engine2 is not None:
+                    return dist_engine2  # type: ignore[return-value]
+                raise  # No distributed available; re-raise original error
 
             loaded = self._entries[model_id]
             self._validate_llm_engine_ready(model_id, loaded.engine)
@@ -1435,6 +1481,13 @@ class EnginePool:
         except Exception as e:
             logger.warning(f"Error stopping engine for {model_id}: {e}")
 
+        # Close the engine to release resources (Metal streams, sockets).
+        try:
+            if hasattr(entry.engine, 'close'):
+                entry.engine.close()
+        except Exception as e:
+            logger.warning(f"Error closing engine for {model_id}: {e}")
+
         # #1595: the immediate-abort stop() above tears the engine down without the normal
         # per-request completion callbacks, so a non-streaming engine's active_requests
         # counter can leak a phantom count (a stale engine then looks permanently busy).
@@ -1497,6 +1550,10 @@ class EnginePool:
         # actual freed memory. Use 2 GB floor for small models. See #768.
         settle_tolerance = max(2 * 1024**3, int(entry.estimated_size * 0.05))
         min_expected_freed = max(0, entry.estimated_size - settle_tolerance)
+
+        # Distributed: this rank only holds a shard, not the full model.
+        if entry.is_distributed and 0 < entry.shard_fraction < 1:
+            min_expected_freed = max(0, int(min_expected_freed * entry.shard_fraction))
         settled = False
         settle_indeterminate = False
         for _settle_round in range(10):
@@ -2142,6 +2199,350 @@ class EnginePool:
             except Exception as e:
                 logger.error(f"Failed to preload pinned model {model_id}: {e}")
 
+    # -------------------------------------------------------------------------
+    # Distributed pipeline loading
+    # -------------------------------------------------------------------------
+
+    async def _try_load_distributed(
+        self,
+        model_id: str,
+        entry: EngineEntry,
+        runtime_settings: object | None,
+    ) -> BaseEngine | None:
+        """Attempt distributed pipeline loading for a model.
+
+        Returns the loaded DistributedPipelineEngine on success, or None
+        if distributed loading is not applicable.
+
+        Decision logic:
+          - load_threshold_gb > 0: proactively distribute when free RAM
+            after local load would be <= threshold, even if the model fits.
+          - load_threshold_gb == 0: skip memory check and always attempt
+            distributed first; caller falls back to local loading on None.
+
+        On success the entry is updated with the distributed engine wrapper.
+        """
+        # Early exit if this model type cannot use distributed pipeline
+        if entry.model_type not in ("llm", "vlm"):
+            return None
+
+        # Check if a global settings accessor is wired in
+        get_settings = getattr(self, "_get_global_settings", None)
+        if not callable(get_settings):
+            return None
+
+        settings = get_settings()
+        if settings is None:
+            return None
+
+        dist = getattr(settings, "distributed", None)
+        if dist is None:
+            return None
+
+        enabled = getattr(dist, "enabled", False)
+        if not enabled:
+            return None
+
+        # --- load_threshold_gb > 0: proactive threshold check ---
+        threshold = getattr(dist, "load_threshold_gb", 0.0) or 0.0
+        if threshold > 0.0:
+            current = max(
+                mx.get_active_memory(),
+                get_phys_footprint(),
+                self._current_model_memory,
+            )
+            if current + entry.estimated_size <= self._current_ceiling():
+                # Model fits locally — only distribute if free RAM after load
+                # would drop to or below the threshold.
+                remaining = self._current_ceiling() - current - entry.estimated_size
+                if remaining > threshold * 1024**3:
+                    return None  # Plenty of headroom; load locally
+
+        # --- Peer discovery ---
+        get_discovery = getattr(self, "_get_discovery_service", None)
+        if not callable(get_discovery):
+            return None
+
+        discovery = get_discovery()
+        if discovery is None:
+            return None
+
+        peer_list = discovery.peers()
+        remote_peers = [p for p in peer_list if not p.is_local]
+        if not remote_peers:
+            return None
+
+        # --- Build distributed endpoints + peer metadata ---
+        logger.info("Building distributed endpoints for %d peers (%s)", len(remote_peers), model_id)
+        try:
+            from .engine.distributed import build_distributed_endpoints
+
+            endpoints, peer_metadata = await build_distributed_endpoints(remote_peers)
+        except Exception:
+            logger.info("Failed to build distributed endpoints for %s", model_id)
+            return None
+
+        if not endpoints:
+            return None
+
+        # --- Cluster key auth (Phase 1) ---
+        cluster_key = getattr(dist, "cluster_key", "") or ""
+        if cluster_key:
+            # Phase 1: trust all discovered peers (full hint matching is Phase 2)
+            for peer in remote_peers:
+                peer.cluster_match = True
+            matching = [
+                (ep, meta, peer) for ep, meta, peer in zip(endpoints, peer_metadata, remote_peers)
+            ]
+            if not matching:
+                logger.info(
+                    "Distributed load skipped for %s: no cluster_key-matching peers",
+                    model_id,
+                )
+                return None
+            endpoints = [ep for ep, _, _ in matching]
+            peer_metadata = [m for _, m, _ in matching]
+        # else: use all discovered peers
+
+        # --- Start DistributedPipelineEngine (coordinator = rank 0) ---
+        try:
+            await self._start_distributed_engine(
+                model_id=model_id,
+                entry=entry,
+                endpoints=endpoints,
+                peer_metadata=peer_metadata,
+                runtime_settings=runtime_settings,
+            )
+        except Exception as e:
+            logger.error(
+                "Distributed pipeline load failed for %s: %s", model_id, e,
+                exc_info=True,
+            )
+            return None
+
+        return entry.engine  # type: ignore[return-value]
+
+    async def _start_distributed_engine(
+        self,
+        model_id: str,
+        entry: EngineEntry,
+        endpoints: list[str],
+        peer_metadata: list[dict],
+        runtime_settings: object | None,
+    ) -> None:
+        """Create and initialize a DistributedPipelineEngine (coordinator rank 0).
+
+        Calls the pipeline engine's init_ring() + load_model(), then wraps
+        it in DistributedEngineWrapper (AsyncEngineCore → EngineCore →
+        DistributedScheduler) so the pool can use standard methods.
+        """
+        # Prevent concurrent loads for same model (matches _load_engine pattern)
+        if entry.is_loading:
+            raise RuntimeError(f"Distributed load already in progress for {model_id}")
+
+        entry.is_loading = True
+        try:
+            model_settings = runtime_settings
+            if model_settings is None and self._settings_manager is not None:
+                try:
+                    from typing import cast as _cast
+                    model_settings = self._settings_manager.get_settings(model_id)  # type: ignore[assignment]
+                except Exception:
+                    model_settings = None
+    
+            trc = (
+                bool(getattr(model_settings, "trust_remote_code", False))
+                if model_settings
+                else False
+            )
+    
+            tokenized_model_path = entry.model_path
+            tokenizer_config: dict | None = getattr(model_settings, "tokenizer_config", None) if model_settings else None
+    
+            # This node's RAM and compute weight
+            ram_available_gb = 0.0
+            try:
+                from .utils import psutil_compat
+                vm = psutil_compat.virtual_memory()
+                ram_available_gb = vm.available / (1024**3)
+            except Exception:
+                pass
+    
+            from .utils.hardware import get_chip_name, get_compute_weight, parse_chip_info
+            chip_string = get_chip_name()
+            chip_name, _ = parse_chip_info(chip_string)
+            compute_weight = get_compute_weight(chip_name)
+    
+            # Coordinator reserves an ephemeral ring port via temp socket,
+            # then closes it so MLX can bind to the same port.
+            import socket as _socket
+            _tmp_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            _tmp_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            _tmp_sock.bind(("0.0.0.0", 0))
+            coordinator_port = _tmp_sock.getsockname()[1]
+            # Close the placeholder — MLX will bind to this port via hostfile.
+            _tmp_sock.close()
+    
+            # Prepend coordinator's own endpoint so indices match ranks (rank 0 = self)
+            from .discovery import _get_local_ip
+
+            local_ip = _get_local_ip()
+            endpoints = [f"{local_ip}:{coordinator_port}"] + endpoints
+
+            # Create pipeline engine and load (init_ring + assignments push + model load)
+            from .engine.distributed import DistributedPipelineEngine
+
+            pipeline = DistributedPipelineEngine(
+                model_path=tokenized_model_path,
+                endpoints=endpoints,
+                local_rank=0,
+                model_id=model_id,
+            )
+
+            # Build peer specs for assignment computation
+            _peer_specs = [{
+                "node_id": m.get("node_id", "unknown"),
+                "ram_total_gb": float(m.get("ram_total_gb", 0)),
+                "ram_available_gb": float(m.get("ram_available_gb", 0)),
+                "compute_weight": float(m.get("compute_weight", 1.0)),
+                "chip_model": m.get("chip_model", ""),
+            } for m in peer_metadata]
+
+            # Create executor with stream initializer. Model loading and inference
+            # both run on this thread so MLX arrays reference the same encoders.
+            from omlx.engine_core import _init_mlx_engine_thread
+
+            # Run model loading on a dedicated OS thread (matching worker pattern).
+            # threading.Thread instead of ThreadPoolExecutor avoids asyncio
+            # conflicts from the executor's initializer running on a thread
+            # that already has an event loop.
+            _load_kwargs = {
+                "total_layers": _resolve_total_layers(tokenized_model_path),
+                "model_storage_gb": entry.estimated_size / (1024**3),
+                "trust_remote_code": trc,
+                "tokenizer_config": tokenizer_config,
+                "peer_specs": _peer_specs,
+                "ram_available_gb": ram_available_gb,
+                "compute_weight": compute_weight,
+            }
+            _result: list = []  # thread-safe result holder [context, loop]
+            _exc_holder: list = []
+            _ready = threading.Event()      # signals loader thread is ready for inference
+            _shutdown = threading.Event()   # tells loader loop to exit
+
+            def _run_on_thread():
+                try:
+                    import asyncio
+                    import mlx.core as mx
+                    # Diagnostics: check for pre-existing event loop on this thread
+                    try:
+                        existing = asyncio.get_event_loop()
+                        logger.info(
+                            "Loader thread: pre-existing event loop, running=%s, closed=%s",
+                            getattr(existing, 'is_running', lambda: False)(),
+                            existing.is_closed(),
+                        )
+                    except RuntimeError:
+                        logger.info("Loader thread: no pre-existing event loop")
+
+                    # Set up thread-local streams (same as _init_mlx_engine_thread)
+                    _cpu_tls = mx.new_thread_local_stream(mx.cpu)
+                    with mx.stream(_cpu_tls):
+                        _cpu_stream = mx.default_stream(mx.cpu)
+                    _gpu_tls = mx.new_thread_local_stream(mx.gpu)
+                    with mx.stream(_gpu_tls):
+                        _gpu_stream = mx.default_stream(mx.gpu)
+                    mx.set_default_stream(_cpu_stream)
+                    mx.set_default_stream(_gpu_stream)
+
+                    # Run async load on this thread's event loop
+                    import threading as _th
+
+                    _ctx_holder = [None]
+                    _done = _th.Event()
+
+                    async def _load_wrapper():
+                        try:
+                            _ctx_holder[0] = await pipeline.load_model(**_load_kwargs)
+                        finally:
+                            _done.set()
+
+                    try:
+                        loop = asyncio.get_running_loop()
+                        logger.info("Loader thread: running loop exists, scheduling task")
+                        asyncio.create_task(_load_wrapper())
+                    except RuntimeError:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        _ctx_holder[0] = loop.run_until_complete(
+                            pipeline.load_model(**_load_kwargs)
+                        )
+                        _done.set()
+
+                    # Block until load completes
+                    _done.wait()
+                    ctx = _ctx_holder[0]
+
+                    # Signal main thread that load is done and we're ready.
+                    _result.append((ctx, loop))
+                    _ready.set()
+
+                    # Keep the event loop running so EngineCore can dispatch step() calls.
+                    # Blocks until someone calls loop.stop() (from engine shutdown).
+                    try:
+                        loop.run_forever()
+                    finally:
+                        loop.close()
+                except Exception:
+                    _exc_holder.append(True)
+                    logger.error("Loader thread error:", exc_info=True)
+
+            _loader = threading.Thread(target=_run_on_thread, daemon=True, name="dist-loader")
+            _loader.start()
+            # Wait for loader to finish model loading (event loop runs forever after)
+            _ready.wait()
+
+            if _exc_holder:
+                raise RuntimeError("Loader thread crashed; see logs for details")
+
+            context, loader_loop = _result[0]
+
+            # Wrap in a BaseEngine-compatible proxy so the pool can use it.
+            wrapper = DistributedEngineWrapper(
+                pipeline_engine=pipeline,
+                tokenizer=pipeline._tokenizer,
+                loader_loop=loader_loop,
+            )
+
+            # Store loader thread for cleanup on shutdown.
+            wrapper._loader_thread = _loader
+    
+            entry.engine = wrapper
+            entry.is_distributed = True
+            entry.shard_fraction = getattr(context, 'shard_fraction', 1.0)
+            entry.last_access = time.time()
+            logger.info(
+                "Distributed pipeline loaded %s (coordinator, rank 0/%d)",
+                model_id,
+                context.group.size() if hasattr(context.group, "size") else len(endpoints),
+            )
+
+        finally:
+            entry.is_loading = False
+
+    def _make_node_spec(
+        self, node_id: str, ram_available_gb: float, compute_weight: float
+    ) -> "NodeSpec":
+        """Create a NodeSpec for allocation."""
+        from ..distributed_sharding import NodeSpec
+        return NodeSpec(
+            node_id=node_id,
+            ram_total_gb=ram_available_gb * 1.2,
+            ram_available_gb=ram_available_gb,
+            compute_weight=compute_weight,
+            chip_model="",
+        )
+
     async def shutdown(self) -> None:
         """Shutdown all engines gracefully."""
         await self._drain_lease_release_tasks()
@@ -2252,3 +2653,23 @@ class EnginePool:
                 expired.append(model_id)
 
         return expired
+
+
+def _load_distributed_pipeline(
+    pipeline: Any,
+    executor: concurrent.futures.ThreadPoolExecutor,
+    load_kwargs: dict,
+) -> Any:
+    """Load a distributed pipeline on the executor thread.
+
+    Uses asyncio.run() which creates a fresh event loop, runs the
+    coroutine, and closes the loop. Must be a module-level function
+    so relative imports inside load_model() resolve correctly.
+    """
+    import asyncio
+
+    try:
+        return asyncio.run(pipeline.load_model(**load_kwargs))
+    except Exception:
+        logger.error("_load_distributed_pipeline full traceback:", exc_info=True)
+        raise

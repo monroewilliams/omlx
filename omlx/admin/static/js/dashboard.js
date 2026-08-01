@@ -118,6 +118,7 @@
                 },
                 ui: { language: 'en' },
                 idle_timeout: { idle_timeout_seconds: null },
+                distributed: { enabled: false, load_threshold_gb: 0.0, cluster_key: '' },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
 
@@ -563,6 +564,9 @@
             accShowText: false,
             accCopied: false,
 
+            // Distributed peers (status page)
+            peers: [],
+
             async init() {
                 // Apply theme
                 this.applyTheme();
@@ -798,6 +802,7 @@
                             claude_code: { ...this.globalSettings.claude_code, ...data.claude_code },
                             integrations: { ...this.globalSettings.integrations, ...data.integrations },
                             idle_timeout: { ...this.globalSettings.idle_timeout, ...data.idle_timeout },
+                            distributed: { ...this.globalSettings.distributed, ...data.distributed },
                             system: { ...this.globalSettings.system, ...data.system },
                         };
                         this.globalSettings.ui = data.ui || { language: 'en' };
@@ -919,6 +924,9 @@
                             ...(this.globalSettings.auth.api_key ? { api_key: this.globalSettings.auth.api_key } : {}),
                             skip_api_key_verification: this.globalSettings.auth.skip_api_key_verification,
                             idle_timeout_seconds: this.globalSettings.idle_timeout?.idle_timeout_seconds ?? null,
+                            distributed_enabled: this.globalSettings.distributed.enabled,
+                            distributed_cluster_key: this.globalSettings.distributed.cluster_key != null ? this.globalSettings.distributed.cluster_key : null,
+                            distributed_load_threshold_gb: this.globalSettings.distributed.load_threshold_gb != null ? Number(this.globalSettings.distributed.load_threshold_gb) : null,
                         }),
                     });
 
@@ -2639,15 +2647,37 @@
             startStatsRefresh() {
                 this.stopStatsRefresh();
                 this.loadStats();
+                this.loadPeers();
                 this._statsRefreshTimer = setInterval(() => {
                     this.loadStats(false);
                 }, 500);
+                this._peersRefreshTimer = setInterval(() => {
+                    this.loadPeers();
+                }, 2000);
             },
 
             stopStatsRefresh() {
                 if (this._statsRefreshTimer) {
                     clearInterval(this._statsRefreshTimer);
                     this._statsRefreshTimer = null;
+                }
+                if (this._peersRefreshTimer) {
+                    clearInterval(this._peersRefreshTimer);
+                    this._peersRefreshTimer = null;
+                }
+            },
+
+            async loadPeers() {
+                try {
+                    const resp = await fetch('/admin/api/peers');
+                    if (resp.ok) {
+                        const data = await resp.json();
+                        this.peers = (data.peers || []).sort(
+                            (a, b) => (b.is_local ? 1 : 0) - (a.is_local ? 1 : 0)
+                        );
+                    }
+                } catch (err) {
+                    console.error('Failed to load peers:', err);
                 }
             },
 

@@ -7,6 +7,7 @@ Provides multiple engine implementations:
 - VLMBatchedEngine: Vision-language model engine with image support
 - EmbeddingEngine: Batch embedding generation using mlx-embeddings
 - RerankerEngine: Document reranking using SequenceClassification models
+- DistributedPipelineEngine: Pipeline parallel inference across multiple Macs
 
 Also re-exports core engine components for backwards compatibility.
 """
@@ -24,6 +25,12 @@ from .sts import STSEngine
 from .tts import TTSEngine
 from .vlm import VLMBatchedEngine
 
+# Optional: distributed pipeline parallel engine (requires mlx.distributed)
+try:
+    from .distributed import DistributedPipelineEngine
+except ImportError:
+    DistributedPipelineEngine = None  # type: ignore[misc,assignment]
+
 __all__ = [
     "BaseEngine",
     "BaseNonStreamingEngine",
@@ -36,6 +43,8 @@ __all__ = [
     "STTEngine",
     "STSEngine",
     "TTSEngine",
+    # Distributed pipeline parallel engine
+    "DistributedPipelineEngine",
     # Core engine components
     "EngineCore",
     "AsyncEngineCore",

@@ -1076,7 +1076,7 @@ class TestGlobalSettings:
             assert custom_logs.exists()
 
     def test_ensure_directories_unavailable_model_dir(self):
-        """Test that unavailable model dirs are skipped instead of crashing."""
+        """Test that unavailable model dirs are logged but NOT removed from settings."""
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir) / "omlx"
             valid_models = Path(tmpdir) / "valid_models"
@@ -1088,9 +1088,9 @@ class TestGlobalSettings:
 
             assert base.exists()
             assert valid_models.exists()
-            # Unavailable path should be removed from model_dirs
+            # Invalid paths should remain in settings so user can edit them
             resolved_dirs = settings.model.get_model_dirs(base)
-            assert len(resolved_dirs) == 1
+            assert len(resolved_dirs) == 2
             assert resolved_dirs[0] == valid_models.resolve()
 
     def test_ensure_directories_unreadable_model_dir(self, tmp_path, monkeypatch):
@@ -1113,8 +1113,9 @@ class TestGlobalSettings:
         settings.model.model_dirs = [str(valid_models), str(unreadable)]
         settings.ensure_directories()
 
+        # Unreadable paths should remain in settings so user can edit them
         resolved_dirs = settings.model.get_model_dirs(base)
-        assert resolved_dirs == [valid_models.resolve()]
+        assert len(resolved_dirs) == 2
 
     def test_validate_valid_settings(self):
         """Test validation with valid settings."""

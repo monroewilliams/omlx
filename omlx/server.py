@@ -44,6 +44,7 @@ import inspect
 import json
 import logging
 import os
+import socket
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -61,6 +62,8 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from omlx._version import __version__
+
+import mlx.core as mx
 
 from .api.anthropic_models import (
     MessagesRequest as AnthropicMessagesRequest,
@@ -477,6 +480,40 @@ async def lifespan(app: FastAPI):
     if mcp_config:
         await init_mcp(mcp_config)
 
+    # Start discovery service if distributed mode is enabled
+    _server_state._discovery_task: asyncio.Task | None = None
+    if (
+        _server_state.global_settings is not None
+        and _server_state.global_settings.distributed.enabled
+    ):
+        try:
+            from .discovery import DiscoveryService
+
+            discovery = DiscoveryService(
+                api_port=_server_state.global_settings.server.port,
+            )
+            await discovery.start()
+            _server_state._discovery_service = discovery
+            await discovery.start_periodic_refresh(interval=60.0)
+            # Wire the discovery accessor into the engine pool for distributed loading
+            _server_state.engine_pool._get_discovery_service = lambda: _server_state._discovery_service
+
+            # Start background task to restart discovery if it stops
+            async def _discovery_loop() -> None:
+                while True:
+                    if not discovery.registry.count():
+                        await asyncio.sleep(10)
+                    else:
+                        # Check if discovery is still running by polling count
+                        try:
+                            await asyncio.sleep(5)
+                        except asyncio.CancelledError:
+                            break
+
+            _server_state._discovery_task = asyncio.create_task(_discovery_loop())
+        except Exception as exc:
+            logger.warning("Discovery service failed to start: %s", exc)
+
     yield
 
     # Shutdown: Save all-time stats, stop TTL task, process memory enforcer, etc.
@@ -511,6 +548,17 @@ async def lifespan(app: FastAPI):
         await _server_state.engine_pool.shutdown()
         _reset_boundary_snapshots_for_server()
         logger.info("Engine pool shutdown")
+
+    # Stop discovery service if running
+    if _server_state._discovery_task is not None:
+        _server_state._discovery_task.cancel()
+        try:
+            await _server_state._discovery_task
+        except asyncio.CancelledError:
+            pass
+    if _server_state._discovery_service is not None:
+        await _server_state._discovery_service.stop()
+        logger.info("Discovery service stopped")
 
 
 app = FastAPI(
@@ -552,6 +600,457 @@ set_admin_getters(
     lambda: _server_state.global_settings,
 )
 app.include_router(admin_router)
+
+
+@app.get("/api/distributed-node-info")
+async def get_distributed_node_info():
+    """Return this node's capabilities for distributed pipeline allocation.
+
+    This endpoint is intentionally unauthenticated — oMLX nodes call it
+    on each discovered peer to determine layer allocation.
+
+    Returns:
+        JSON with node_id, ram_total_gb, ram_available_gb, chip_model,
+        compute_weight.
+    """
+    from .discovery import DiscoveryService
+    from .utils.hardware import build_distributed_node_info
+
+    # Try to get node_id from the running discovery service
+    state = get_server_state()
+    discovery: DiscoveryService | None = getattr(state, "_discovery_service", None)
+
+    node_id = discovery.my_node_id if discovery else "unknown"
+    return build_distributed_node_info(node_id)
+
+
+# =============================================================================
+# Distributed pipeline port reservation — consolidated persistent connection
+# =============================================================================
+# Single endpoint: POST /api/distributed/trigger-worker
+# Supports a multi-phase handshake over one HTTP/1.1 persistent connection:
+#   Phase 1: Trigger     -> reserve ephemeral ring port, return cookie
+#   Phase 2: Ring List   -> validate cookie, close placeholder socket, store ring config
+#   Phase 3: Assignment  -> deliver model loading details, kick off load task
+#
+# Cluster key challenge-response mutual auth (HMAC-based):
+#   First request -> server sends nonce in response
+#   Next request  -> client sends HMAC(cluster_key, phase_name + "|" + nonce)
+#   Server verifies -> if valid, marks session as authenticated
+#   Reverse auth  -> server includes HMAC(cluster_key, "server_auth|" + nonce)
+#                   in its response; client verifies server knows the key
+#   Eavesdropper sees only random nonces and HMACs -> never learns the key.
+# =============================================================================
+
+import hashlib
+import hmac as hmac_module
+import threading
+
+# Per-worker session state (keyed by worker IP address)
+_distributed_sessions: dict[str, dict] = {}  # ip -> {ring_reservations: {}, auth_pending: bool, challenge_nonce: str | None}
+_distributed_authed_workers: set[str] = set()  # IPs that passed mutual auth
+_distributed_reservations: dict[str, dict] = {}  # cookie -> {port, rank, socket}
+_distributed_pending_rings: dict[int, dict] = {}  # rank -> {endpoints, ring_port}
+_distributed_lock = threading.Lock()
+
+
+def _verify_hmac(cluster_key: str, provided: str | None, expected_data: str) -> bool:
+    """Verify HMAC-based challenge-response."""
+    if not cluster_key or not provided:
+        return False
+    computed = hmac_module.new(
+        cluster_key.encode(), expected_data.encode(), hashlib.md5
+    ).hexdigest()
+    return hmac_module.compare_digest(computed, provided)
+
+
+def _get_session_ip(request: FastAPIRequest) -> str:
+    """Extract worker IP from request."""
+    return (
+        request.client.host if request.client
+        else request.headers.get("X-Forwarded-For", "unknown")
+    )
+
+
+def _get_cluster_key() -> str:
+    """Get configured cluster key from settings."""
+    try:
+        gs = get_server_state().global_settings
+        if gs and gs.distributed:
+            return getattr(gs.distributed, "cluster_key", "") or ""
+    except Exception:
+        pass
+    return ""
+
+
+@app.post("/api/distributed/trigger-worker")
+async def trigger_worker_distributed_load(request: FastAPIRequest):
+    """Consolidated distributed pipeline worker endpoint.
+
+    Handles all three phases of the port reservation + ring distribution
+    protocol over a persistent HTTP/1.1 connection from the coordinator.
+
+    Cluster key challenge-response mutual authentication:
+        If cluster_key is set, the first request triggers a nonce challenge.
+        Subsequent requests must include `auth: HMAC(cluster_key, phase_name + "|" + nonce)`.
+        The server also proves knowledge by including its own HMAC in the response.
+
+    Phase 1 (trigger) -- body: { model_id, rank }
+        Picks ephemeral ring port, returns { port, cookie }
+
+    Phase 2 (ring-list) -- body: { endpoints, ring_port, cookie [, auth] }
+        Validates cookie, closes placeholder socket, stores ring config.
+
+    Phase 3 (assignment) -- body: { model_id, rank, start_layer, end_layer [, auth] }
+        Kicks off async model load on the worker.
+
+    Returns: JSON response appropriate to the detected phase.
+    """
+    import uuid
+    from fastapi import HTTPException
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    worker_ip = _get_session_ip(request)
+    cluster_key = _get_cluster_key()
+
+    # --- Phase detection & state management ---
+    model_id = body.get("model_id")
+    rank = int(body.get("rank", -1))
+    is_coordinator = (rank <= 0)
+
+    cookie_val = body.get("cookie")
+    has_endpoints = "endpoints" in body and body["endpoints"]
+
+    if has_endpoints and cookie_val:
+        phase = "ring-list"
+    elif model_id and rank > 0 and "start_layer" in body:
+        phase = "assignment"
+    else:
+        phase = "trigger"
+
+    # Track auth state per worker IP in session dict
+    with _distributed_lock:
+        if worker_ip not in _distributed_sessions:
+            _distributed_sessions[worker_ip] = {
+                "ring_reservations": {},  # cookie -> {port, rank, socket}
+                "auth_pending": bool(cluster_key and not is_coordinator),
+                "challenge_nonce": None,
+            }
+
+        session = _distributed_sessions[worker_ip]
+        provided_auth = body.get("auth") or request.headers.get("X-Auth", "")
+
+        # --- Auth check (non-coordinator only, after phase detection) ---
+        if not is_coordinator:
+            if session["auth_pending"] and phase in ("ring-list", "assignment"):
+                if not _verify_hmac(cluster_key, provided_auth, session["challenge_nonce"] or ""):
+                    return {"error": "authentication failed", "status": "auth_required"}
+
+                session["auth_pending"] = False
+                _distributed_authed_workers.add(worker_ip)
+
+    # --- Phase 1: Trigger -- reserve ephemeral ring port ---
+    if phase == "trigger":
+        if not model_id:
+            raise HTTPException(status_code=400, detail="model_id required")
+
+        tmp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tmp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            tmp_sock.bind(("0.0.0.0", 0))
+            port = tmp_sock.getsockname()[1]
+        except OSError:
+            tmp_sock.close()
+            raise HTTPException(
+                status_code=500, detail="Failed to bind ephemeral port"
+            )
+
+        cookie_val = uuid.uuid4().hex
+
+        with _distributed_lock:
+            _distributed_reservations[cookie_val] = {
+                "port": port,
+                "rank": rank,
+                "socket": tmp_sock,
+            }
+            _distributed_sessions[worker_ip]["ring_reservations"][cookie_val] = (
+                _distributed_reservations[cookie_val]
+            )
+
+        port_to_log = port
+        cookie_to_log = cookie_val
+    elif phase == "ring-list":
+        # --- Phase 2: Ring list -- validate cookie, close socket, store config ---
+        ring_port = int(body.get("ring_port", 5000))
+        endpoints = body.get("endpoints", [])
+
+        with _distributed_lock:
+            if cookie_val not in _distributed_reservations:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"No reservation found for cookie {cookie_val[:8]}",
+                )
+
+            res = _distributed_reservations.pop(cookie_val)
+            rank = res["rank"]
+            sock = res["socket"]
+
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+        with _distributed_lock:
+            _distributed_pending_rings[rank] = {
+                "endpoints": endpoints,
+                "ring_port": ring_port,
+            }
+
+        logger.info(
+            "Ring list delivered to rank %d: ring_port=%d, endpoints=%s",
+            rank, ring_port, endpoints,
+        )
+
+        response: dict[str, Any] = {"ready": True}
+
+        # Server proof of auth (reverse auth)
+        if cluster_key and not is_coordinator:
+            nonce = session.get("challenge_nonce") or uuid.uuid4().hex
+
+            with _distributed_lock:
+                if worker_ip in _distributed_sessions:
+                    _distributed_sessions[worker_ip]["challenge_nonce"] = nonce
+
+            server_auth = hmac_module.new(
+                cluster_key.encode(), f"server_auth|{nonce}".encode(), hashlib.md5
+            ).hexdigest()
+            response["server_auth"] = server_auth
+
+        return response
+    else:
+        # --- Phase 3: Assignment -- kick off worker model load ---
+        start_layer = int(body.get("start_layer", 0))
+        end_layer = int(body.get("end_layer", 0))
+
+        if not model_id:
+            raise HTTPException(status_code=400, detail="model_id required")
+        if rank <= 0:
+            raise HTTPException(status_code=400, detail="rank must be > 0 for workers")
+        if start_layer >= end_layer:
+            raise HTTPException(
+                status_code=400, detail="start_layer must be < end_layer"
+            )
+
+        # Kick off model loading as a fire-and-forget background task.
+        # Do NOT await — the coordinator has only a 10s timeout and we need
+        # to return immediately so it can proceed with init_ring().
+        # Ring endpoints were already delivered by Phase 2, so _load_worker()
+        # has everything it needs.
+        asyncio.create_task(_execute_worker_assignment(
+            model_id, rank, start_layer, end_layer,
+        ))
+
+        logger.info(
+            "Assignment delivered to rank %d: layers [%d:%d] (loading in background)",
+            rank, start_layer, end_layer,
+        )
+
+        response = {"success": True}
+
+        # Server proof of auth (reverse auth)
+        if cluster_key and not is_coordinator:
+            nonce = session.get("challenge_nonce") or uuid.uuid4().hex
+
+            with _distributed_lock:
+                if worker_ip in _distributed_sessions:
+                    _distributed_sessions[worker_ip]["challenge_nonce"] = nonce
+
+            server_auth = hmac_module.new(
+                cluster_key.encode(), f"server_auth|{nonce}".encode(), hashlib.md5
+            ).hexdigest()
+            response["server_auth"] = server_auth
+
+        return response
+
+    # Only reached by Phase 1 (trigger)
+    logger.info(
+        "Ring port reserved for rank %d: port=%d, cookie=%s",
+        rank, port_to_log, cookie_to_log[:8],
+    )
+
+    response = {"port": port_to_log, "cookie": cookie_val}
+
+    # --- Challenge-response auth for first request (non-coordinator) ---
+    if not is_coordinator and cluster_key:
+        nonce = uuid.uuid4().hex
+
+        with _distributed_lock:
+            if worker_ip in _distributed_sessions:
+                _distributed_sessions[worker_ip]["challenge_nonce"] = nonce
+
+        server_auth = hmac_module.new(
+            cluster_key.encode(), f"server_nonce|{nonce}".encode(), hashlib.md5
+        ).hexdigest()
+
+        response["challenge"] = nonce
+        response["server_auth"] = server_auth
+
+    return response
+
+
+# Assignment handler — called by the consolidated trigger-worker endpoint
+# for Phase 3 (assignment delivery). Defined separately so it can be reused.
+async def _execute_worker_assignment(
+    model_id: str, rank: int, start_layer: int, end_layer: int
+) -> None:
+    """Kick off async model load on the worker (Phase 3 of pipeline protocol)."""
+    from pathlib import Path as _Path
+
+    logger.info(
+        "Phase 3: executing assignment for rank %d layers [%d:%d] model=%s",
+        rank, start_layer, end_layer, model_id,
+    )
+
+    get_pool = getattr(_server_state, "engine_pool", None)
+    entry = getattr(get_pool, "_entries", {}).get(model_id) if get_pool else None
+    model_path = entry.model_path if entry and getattr(entry, "model_path", None) else model_id
+
+    if not _Path(model_path).is_dir():
+        logger.error(
+            "Model '%s' not found on this node for rank %d", model_id, rank
+        )
+        return
+
+    from omlx.engine.distributed import DistributedPipelineEngine
+    from omlx.distributed_sharding import LayerAssignment
+
+    async def _load_worker():
+        import threading
+
+        ring_info = _distributed_pending_rings.pop(rank, None)
+        if ring_info is None:
+            logger.error(
+                "Worker rank %d: no ring list found, cannot load model", rank,
+            )
+            return
+        logger.info(
+            "Worker rank %d: ring_info found, endpoints=%s, ring_port=%s",
+            rank, ring_info.get("endpoints"), ring_info.get("ring_port"),
+        )
+
+        def _load_and_run():
+            """Run entirely on the worker OS thread — stream setup + model load + loop."""
+            logger.info("Rank %d: _load_and_run entered", rank)
+            try:
+                import asyncio
+
+                logger.info("Rank %d: creating worker thread event loop", rank)
+                event_loop = asyncio.new_event_loop()
+                logger.info("Rank %d: event loop created", rank)
+                asyncio.set_event_loop(event_loop)
+
+                logger.info("Rank %d: creating thread-local streams", rank)
+                _cpu_tls = mx.new_thread_local_stream(mx.cpu)
+                _gpu_tls = mx.new_thread_local_stream(mx.gpu)
+
+                # Convert TLS to real Streams and set as defaults.
+                with mx.stream(_cpu_tls):
+                    _cpu_stream = mx.default_stream(mx.cpu)
+                with mx.stream(_gpu_tls):
+                    _gpu_stream = mx.default_stream(mx.gpu)
+                mx.set_default_stream(_cpu_stream)
+                mx.set_default_stream(_gpu_stream)
+
+                pipeline = DistributedPipelineEngine(
+                    model_path=model_path,
+                    endpoints=ring_info["endpoints"],
+                    local_rank=rank,
+                )
+                pipeline._local_assignment = LayerAssignment(
+                    start_layer=start_layer,
+                    end_layer=end_layer,
+                    node_id=f"rank_{rank}",
+                )
+
+                # Run async load_model on this thread's event loop.
+                logger.info("Rank %d: starting model load", rank)
+                event_loop.run_until_complete(pipeline.load_model())
+
+                logger.info(
+                    "Worker rank %d: distributed model loaded %s (layers [%d:%d])",
+                    rank, model_id, start_layer, end_layer,
+                )
+
+                # Create worker engine for memory tracking (ProcessMemoryEnforcer).
+                # Worker does not run EngineCore's step loop — coordinator drives
+                # all work through pipeline layer wrappers.
+                from omlx.engine.distributed import DistributedWorkerEngine
+                worker_engine = DistributedWorkerEngine(
+                    model=pipeline._model,
+                    tokenizer=pipeline._tokenizer,
+                )
+
+                # Register in engine_pool for ProcessMemoryEnforcer discovery.
+                if entry is not None:
+                    entry.engine = worker_engine
+                    entry.is_distributed = True
+                    entry.last_access = time.time()
+                    logger.info(
+                        "Distributed pipeline loaded %s (worker, rank %d)",
+                        model_id, rank,
+                    )
+
+                logger.info("Rank %d: starting worker loop", rank)
+                try:
+                    pipeline._worker_loop()
+                finally:
+                    import gc
+                    # Worker loop exited (ring error or process shutdown).
+                    # Destroy pipeline — drops _group reference, triggers
+                    # C++ RingGroup destructor which shuts down sockets.
+                    if pipeline is not None:
+                        del pipeline
+                        logger.info("Rank %d: pipeline destroyed", rank)
+
+                    # Clear engine from pool so next assignment does fresh load.
+                    if entry is not None and entry.engine is not None:
+                        try:
+                            eng = entry.engine
+                            if hasattr(eng, "close"):
+                                logger.info("Rank %d: closing worker engine", rank)
+                                eng.close()
+                        except Exception:
+                            logger.warning("Rank %d: worker engine close failed", rank)
+                        entry.engine = None
+                    # Clean up Metal state so next load starts fresh.
+                    logger.info("Rank %d: Metal cleanup (sync+clear_cache+clear_streams)", rank)
+                    mx.synchronize()
+                    mx.clear_cache()
+                    mx.clear_streams()
+                    gc.collect()
+            except Exception as e:
+                import traceback
+                logger.error(
+                    "Rank %d: worker failed (%s)\n%s",
+                    rank, e, traceback.format_exc(),
+                )
+            finally:
+                mx.clear_streams()
+                event_loop.close()
+
+        t = threading.Thread(target=_load_and_run, daemon=True)
+        t.start()
+        logger.info("Rank %d: worker thread started", rank)
+
+    # Kick off model loading in the background — do NOT await.
+    # Phase 3 returns immediately so the coordinator can proceed with init_ring().
+    asyncio.create_task(_load_worker())
+
+
 
 
 @app.exception_handler(_RedirectToLogin)
@@ -1756,6 +2255,8 @@ def init_server(
 
     # Discover models (use pinned models from settings file)
     _server_state.engine_pool._settings_manager = _server_state.settings_manager
+    # Wire distributed loading helpers into the pool.
+    _server_state.engine_pool._get_global_settings = lambda: _server_state.global_settings
     _server_state.engine_pool.discover_models(dir_list, pinned_models)
     _server_state.engine_pool.apply_settings_overrides(_server_state.settings_manager)
 

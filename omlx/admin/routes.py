@@ -308,6 +308,11 @@ class GlobalSettingsRequest(BaseModel):
     api_key: str | None = None
     skip_api_key_verification: bool | None = None
 
+    # Distributed pipeline settings
+    distributed_enabled: bool | None = None
+    distributed_load_threshold_gb: float | None = None
+    distributed_cluster_key: str | None = None
+
 
 class HFDownloadRequest(BaseModel):
     """Request model for starting a HuggingFace model download."""
@@ -3157,6 +3162,8 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
     )
     disk_info = get_ssd_disk_info(cache_dir)
 
+    import hashlib
+
     return {
         "base_path": str(global_settings.base_path),
         "server": {
@@ -3287,6 +3294,98 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "idle_timeout": {
             "idle_timeout_seconds": global_settings.idle_timeout.idle_timeout_seconds,
         },
+        "distributed": {
+            "enabled": global_settings.distributed.enabled,
+            "load_threshold_gb": global_settings.distributed.load_threshold_gb,
+            "cluster_key": global_settings.distributed.cluster_key or "",
+            "cluster_key_hint": (
+                hashlib.sha256(global_settings.distributed.cluster_key.encode()).hexdigest()[:8]
+                if global_settings.distributed.cluster_key else ""
+            ),
+        },
+    }
+
+
+@router.get("/api/peers")
+async def get_peers(is_admin: bool = Depends(require_admin)):
+    """Get discovered peers for distributed pipeline loading.
+
+    Returns a list of locally-discovered oMLX nodes via mDNS,
+    along with this node's own info. If discovery is not running
+    or zeroconf is unavailable, returns an empty list with metadata.
+
+    Returns:
+        JSON response with peer list and discovery status.
+    """
+    import asyncio
+    import hashlib
+
+    from ..discovery import DiscoveryService
+
+    # Try to access the discovery service from global settings
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        return {
+            "peers": [],
+            "my_node_id": "",
+            "discovery_running": False,
+            "enabled": False,
+        }
+
+    distributed_settings = global_settings.distributed
+
+    # Compute cluster key hint (first 8 hex chars of SHA-256)
+    cluster_key_hint = None
+    if distributed_settings.cluster_key:
+        cluster_key_hint = hashlib.sha256(
+            distributed_settings.cluster_key.encode()
+        ).hexdigest()[:8]
+
+    # The discovery service is managed by the server lifecycle.
+    # We store it as an attribute on _server_state when initialized.
+    from ..server import get_server_state
+
+    state = get_server_state()
+    discovery: DiscoveryService | None = getattr(state, "_discovery_service", None)
+
+    if discovery is not None:
+        my_node_id = discovery.my_node_id
+        peers_basic = discovery.peer_list()
+
+        enriched_peers = []
+        for p in peers_basic:
+            # Determine if this peer matches our cluster key hint
+            peer_match = None  # True/False if we have a key, None if no key
+            if cluster_key_hint is not None:
+                # For now assume all discovered peers are in same cluster;
+                # full hint matching comes when we have hint from mDNS TXT.
+                peer_match = True
+            enriched_peers.append({
+                "node_id": p["node_id"],
+                "host": p.get("host", ""),
+                "api_port": p.get("api_port", 8000),
+                "ram_total_gb": p.get("ram_total_gb", 0.0),
+                "ram_available_gb": p.get("ram_available_gb", 0.0),
+                "chip_model": p.get("chip_model", ""),
+                "compute_weight": p.get("compute_weight", 1.0),
+                "is_local": p.get("is_local", False),
+                "cluster_match": peer_match,
+            })
+
+        return {
+            "peers": enriched_peers,
+            "my_node_id": my_node_id,
+            "discovery_running": True,
+            "enabled": distributed_settings.enabled,
+            "cluster_key_hint": cluster_key_hint,
+        }
+
+    return {
+        "peers": [],
+        "my_node_id": "",
+        "discovery_running": False,
+        "enabled": distributed_settings.enabled,
+        "cluster_key_hint": cluster_key_hint,
     }
 
 
@@ -3904,6 +4003,20 @@ async def update_global_settings(
             request.skip_api_key_verification
         )
         runtime_applied.append("skip_api_key_verification")
+
+    # Apply distributed settings (requires restart)
+    if request.distributed_enabled is not None:
+        global_settings.distributed.enabled = request.distributed_enabled
+        runtime_applied.append("distributed")
+        logger.info(
+            f"Distributed mode {'enabled' if request.distributed_enabled else 'disabled'}"
+        )
+    if request.distributed_load_threshold_gb is not None:
+        global_settings.distributed.load_threshold_gb = float(
+            request.distributed_load_threshold_gb
+        )
+    if request.distributed_cluster_key is not None:
+        global_settings.distributed.cluster_key = request.distributed_cluster_key
 
     if pending_embedding_batch_size is not None:
         previous_embedding_batch_size = global_settings.scheduler.embedding_batch_size
@@ -6785,3 +6898,5 @@ async def remove_upload_task(task_id: str, is_admin: bool = Depends(require_admi
     if not success:
         raise HTTPException(status_code=404, detail="Task not found or still active")
     return {"success": True}
+
+

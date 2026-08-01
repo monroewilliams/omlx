@@ -347,3 +347,113 @@ def format_bytes(bytes_value: int) -> str:
         return f"{bytes_value / 1024:.2f} KB"
     else:
         return f"{bytes_value} B"
+
+
+# =============================================================================
+# Compute weight estimation — ALL NUMBERS BELOW ARE MADE UP PLACEHOLDERS
+# =============================================================================
+# These values feed into `allocate_layers()` as a multiplier on ram_fraction
+# to decide how many layers each node gets. They have NOT been benchmarked.
+#
+# TODO: Replace with real per-chip benchmarks (e.g. time-to-first-token for
+# a standard layer on each Mac, or Geekbench 6 single-core GPU scores).
+# The current numbers are guesses based on rough generation-overlap logic.
+#
+# Design notes (current heuristic, not backed by data):
+#   - Normalized so the "most powerful current chip" = 1.0 (hardcoded
+#     reference of M5 Max 40-core). Replace that reference with a real chip
+#     once the cluster is finalized.
+#   - Tier multiplier (Ultra/Max/Pro/Air/Base) is guessed: Ultra gets 2x
+#     single-die because it's two dies, but the exact ratio is unknown.
+#   - No M4 Ultra exists — this code path would be hit for future chips.
+
+_GEN_UPFIFT: dict[str, float] = {  # ALL MADE UP
+    "M1": 1.0,
+    "M2": 1.15,
+    "M3": 1.20,
+    "M4": 1.25,
+    "M5": 1.30,
+}
+
+_GPU_PER_CORE_UPFIT: dict[str, float] = {  # ALL MADE UP
+    "M1": 1.0,
+    "M2": 1.15,
+    "M3": 1.20,
+    "M4": 1.25,
+    "M5": 1.30,
+}
+
+
+def get_compute_weight(chip_name: str, gpu_cores: int | None = None) -> float:
+    """Estimate normalized compute weight for a chip.
+
+    WARNING: All numbers in this function are made-up placeholders. See the
+    module-level comments above.
+
+    Args:
+        chip_name: Full chip name, e.g. "M4 Pro", "M3 Max".
+        gpu_cores: GPU core count from ``get_gpu_core_count()``.
+
+    Returns:
+        Normalized compute weight in [0.3, 1.0]. (Garbage output until
+        replaced with real benchmarks.)
+    """
+    import re as _re
+
+    if gpu_cores and gpu_cores > 0:
+        gen_match = _re.search(r"(M\d+)", chip_name, _re.IGNORECASE)
+        gen = gen_match.group(1).upper() if gen_match else "M1"
+
+        upfit = _GPU_PER_CORE_UPFIT.get(gen, 1.0)
+        raw_weight = gpu_cores * upfit
+
+        # Reference is M5 Max 40-core — also a guess
+        REFERENCE = 40.0 * _GPU_PER_CORE_UPFIT.get("M5", 1.3)
+        return min(raw_weight / REFERENCE, 1.0)
+
+    # No core count — fall back to generation-based default (also guessed)
+    gen_match = _re.search(r"(M\d+)", chip_name, _re.IGNORECASE)
+    gen = gen_match.group(1).upper() if gen_match else "M1"
+    gen_upfit = _GEN_UPFIFT.get(gen, 1.0)
+
+    tier_mult = 1.0
+    for word in ["Ultra", "Max", "Pro", "Air", "Base"]:
+        if word.lower() in chip_name.lower():
+            tier_mult = {"Ultra": 1.0, "Max": 0.9, "Pro": 0.75, "Air": 0.55, "Base": 0.45}.get(word, 1.0)
+            break
+
+    if "Ultra" in chip_name.upper():
+        tier_mult *= 2.0
+
+    return min(gen_upfit * tier_mult / 1.3, 1.0)
+
+
+def build_distributed_node_info(
+    node_id: str,
+) -> dict[str, Any]:
+    """Build the node info dict for distributed /api/distributed-node-info.
+
+    Args:
+        node_id: This node's identifier (from DiscoveryService).
+
+    Returns:
+        Dict with keys suitable for layer allocation: node_id,
+        ram_total_gb, ram_available_gb, chip_model, compute_weight.
+    """
+    from ..utils.psutil_compat import virtual_memory
+
+    chip_string = get_chip_name()
+    chip_name, chip_variant = parse_chip_info(chip_string)
+    gpu_cores = get_gpu_core_count()
+
+    vm = virtual_memory()
+    ram_total_gb = round(vm.total / (1024**3), 1)
+    ram_available_gb = round(vm.available / (1024**3), 1)
+
+    return {
+        "node_id": node_id,
+        "ram_total_gb": ram_total_gb,
+        "ram_available_gb": ram_available_gb,
+        "chip_model": f"Apple {chip_string}" if chip_string else "Unknown",
+        "compute_weight": get_compute_weight(chip_name, gpu_cores),
+    }

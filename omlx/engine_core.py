@@ -129,6 +129,48 @@ def _init_mlx_thread() -> None:
     logger.info(f"MLX executor thread initialized: generation_stream = {stream}")
 
 
+def _init_mlx_engine_thread() -> None:
+    """Initialize thread-local MLX streams (CPU + GPU) for per-engine executor.
+
+    Replaces the bare ThreadPoolExecutor initializer so each EngineCore's
+    inference thread has its own CPU command encoder (needed for ring
+    communication) and GPU stream (needed for model inference).
+
+    MLX 0.32+ uses thread-local CPU command encoders — arrays created on
+    the main thread can still be read here, but any CPU-side operations
+    (ring send/recv mx.eval) need the local encoder.
+    """
+    import asyncio
+    import mlx.core as mx
+
+    # Diagnostics: check for pre-existing event loop on this thread
+    try:
+        existing = asyncio.get_event_loop()
+        logger.info(
+            "EngineCore executor init: pre-existing event loop found, running=%s, closed=%s",
+            getattr(existing, 'is_running', lambda: False)(),
+            existing.is_closed(),
+        )
+    except RuntimeError:
+        logger.info("EngineCore executor init: no pre-existing event loop")
+
+    # CPU stream — required for ring communication (socket thread futures).
+    _cpu_tls = mx.new_thread_local_stream(mx.cpu)
+    with mx.stream(_cpu_tls):
+        _cpu_stream = mx.default_stream(mx.cpu)
+    # GPU stream — required for model inference.
+    _gpu_tls = mx.new_thread_local_stream(mx.gpu)
+    with mx.stream(_gpu_tls):
+        _gpu_stream = mx.default_stream(mx.gpu)
+    mx.set_default_stream(_cpu_stream)
+    mx.set_default_stream(_gpu_stream)
+    logger.info(
+        "EngineCore executor thread init: cpu=%s gpu=%s",
+        mx.default_stream(mx.cpu),
+        mx.default_stream(mx.gpu),
+    )
+
+
 def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
     """Get or create the global MLX executor (lazy singleton).
 
@@ -156,6 +198,9 @@ class EngineConfig:
     step_interval: float = 0.05  # Idle wait timeout; requests wake the loop
     stream_interval: int = 1  # Tokens to batch before streaming (1=every token)
     prefill_eviction_callback: Optional[Callable[[Any], Awaitable[bool]]] = None
+    # Scheduler class to use (defaults to ``Scheduler`` from this package).
+    # Override for specialisation (e.g. ``DistributedScheduler``).
+    scheduler_class: Optional[Callable] = None
     # Decode burst: run several scheduler.step() calls per run_in_executor
     # hand-off instead of one. Each decode token otherwise bounces back to the
     # event loop, ping-ponging the GIL with the asyncio loop + uvicorn on the
@@ -203,6 +248,7 @@ class EngineCore:
         config: Optional[EngineConfig] = None,
         engine_id: Optional[str] = None,
         force_model_ownership: bool = True,
+        executor: Optional[Any] = None,
     ):
         """
         Initialize the engine.
@@ -215,6 +261,9 @@ class EngineCore:
             force_model_ownership: If True (default), forcibly take model ownership
                                    from any existing engine. If False, raises
                                    ModelOwnershipError if model is in use.
+            executor: Optional pre-created ThreadPoolExecutor. If provided,
+                      the model was loaded on this executor's thread and
+                      inference runs there. Must have stream initializer set.
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -237,14 +286,20 @@ class EngineCore:
         # Each EngineCore gets its own thread + GPU stream so different
         # models can run scheduler.step() concurrently.
         self._mlx_stream = mx.new_thread_local_stream(mx.default_device())
-        self._mlx_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix=f"mlx-engine-{self._engine_id[:8]}",
-        )
+        if executor is not None:
+            # Reuse pre-created executor (model was loaded on its thread).
+            self._mlx_executor = executor
+        else:
+            self._mlx_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"mlx-engine-{self._engine_id[:8]}",
+                initializer=_init_mlx_engine_thread,
+            )
 
         # Create scheduler with per-engine stream
         scheduler_config = self.config.scheduler_config or SchedulerConfig()
-        self.scheduler = Scheduler(
+        _cls = self.config.scheduler_class or Scheduler
+        self.scheduler = _cls(
             model=model,
             tokenizer=tokenizer,
             config=scheduler_config,
@@ -1254,8 +1309,9 @@ class AsyncEngineCore:
         model: Any,
         tokenizer: Any,
         config: Optional[EngineConfig] = None,
+        executor: Optional[Any] = None,
     ):
-        self.engine = EngineCore(model, tokenizer, config)
+        self.engine = EngineCore(model, tokenizer, config, executor=executor)
         # Drop wrapper-local aliases after EngineCore takes ownership.
         model = None
         tokenizer = None

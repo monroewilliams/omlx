@@ -376,6 +376,34 @@
                         </div>
                     </div>
 
+                    <!-- Distributed Peers -->
+                    <div x-show="globalSettings.distributed.enabled && peers.length > 0" class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
+                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-6 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="network" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.distributed_peers.section_label') }}</span>
+                            </div>
+                        </div>
+                        <div class="divide-y divide-neutral-100">
+                            <!-- Peer rows -->
+                            <template x-for="peer in peers" :key="peer.node_id">
+                                <div class="px-4 sm:px-6 py-3 flex items-center justify-between gap-4">
+                                    <div class="flex items-center gap-3 min-w-0">
+                                        <i x-show="!peer.is_local" data-lucide="monitor" class="w-4 h-4 text-neutral-400 flex-shrink-0"></i>
+                                        <i x-show="peer.is_local" data-lucide="server" class="w-4 h-4 text-blue-500 flex-shrink-0"></i>
+                                        <div class="min-w-0">
+                                            <span class="text-sm text-neutral-700 font-mono" x-text="peer.node_id"></span>
+                                            <template x-if="peer.is_local">
+                                                <span class="text-[10px] font-medium text-blue-500 ml-2">local</span>
+                                            </template>
+                                            <span class="text-[10px] text-neutral-400 ml-2" x-text="peer.host ? peer.host : ''"></span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+
                     <!-- Runtime Cache Observability -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
                         <div class="lg:hidden flex flex-col gap-3 px-4 py-4 bg-neutral-100 border-b border-neutral-200">

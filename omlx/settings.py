@@ -780,6 +780,45 @@ class IntegrationSettings:
 
 
 @dataclass
+class DistributedSettings:
+    """Distributed pipeline parallel configuration (persisted to settings.json).
+
+    When enabled, the node advertises itself via mDNS and discovers peers.
+    Model loads automatically become distributed pipelines when free memory
+    after load would be <= load_threshold_gb (0.0 = only distribute if
+    model doesn't fit at all).
+    """
+
+    enabled: bool = False
+    # Distribute if free memory after load would be <= this (GB). 0.0 = only
+    # distribute if model doesn't fit locally at all. Set to e.g. 16.0 to
+    # always distribute when it would consume more than the threshold's worth
+    # of RAM, even if the model fits.
+    load_threshold_gb: float = 0.0
+    # Shared secret for cluster authentication. Empty string = no auth.
+    # Non-empty values must match across all peers in the cluster to
+    # prevent disjoint installations from merging on shared subnets.
+    cluster_key: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "enabled": self.enabled,
+            "load_threshold_gb": self.load_threshold_gb,
+            "cluster_key": self.cluster_key,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DistributedSettings:
+        """Create from dictionary."""
+        return cls(
+            enabled=data.get("enabled", False),
+            load_threshold_gb=float(data.get("load_threshold_gb", 0.0)),
+            cluster_key=data.get("cluster_key", ""),
+        )
+
+
+@dataclass
 class GlobalSettings:
     """
     Global settings for oMLX.
@@ -810,6 +849,7 @@ class GlobalSettings:
     idle_timeout: ModelIdleTimeoutSettings = field(
         default_factory=ModelIdleTimeoutSettings
     )
+    distributed: DistributedSettings = field(default_factory=DistributedSettings)
 
     @classmethod
     def load(
@@ -906,6 +946,10 @@ class GlobalSettings:
             if "idle_timeout" in data:
                 self.idle_timeout = ModelIdleTimeoutSettings.from_dict(
                     data["idle_timeout"]
+                )
+            if "distributed" in data:
+                self.distributed = DistributedSettings.from_dict(
+                    data["distributed"]
                 )
 
         except json.JSONDecodeError as e:
@@ -1027,6 +1071,12 @@ class GlobalSettings:
         ):
             self.integrations.markitdown_pdf_processing_engine = (
                 markitdown_pdf_processing_engine.strip() or "markitdown"
+            )
+
+        # Distributed settings
+        if dist_enabled := os.getenv("OMLX_DISTRIBUTED_ENABLED"):
+            self.distributed.enabled = (
+                dist_enabled.strip().lower() in {"1", "true", "yes", "on"}
             )
 
     def _apply_cli_overrides(self, args: Any, *, include_api_key: bool = True) -> None:
@@ -1199,6 +1249,7 @@ class GlobalSettings:
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
+            "distributed": self.distributed.to_dict(),
         }
 
         try:
@@ -1264,9 +1315,9 @@ class GlobalSettings:
 
             valid_dirs.append(str(directory))
 
-        # Update model_dirs to only include valid paths
-        self.model.model_dirs = valid_dirs
-        self.model.model_dir = None
+        # Log unavailable directories but do NOT mutate user settings —
+        # invalid paths should remain in the saved config so the user can
+        # edit them.  Only create missing directories here.
 
     def validate(self) -> list[str]:
         """
