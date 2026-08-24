@@ -88,9 +88,22 @@ def apply_chat_template_with_reasoning_effort_fallback(
     """Render with one alias retry, then the template's native default."""
     original_kwargs = dict(template_kwargs)
     if "reasoning_effort" not in original_kwargs:
+        # TEMP DEBUG: per-turn reasoning level (absent = template default)
+        enable_thinking = original_kwargs.get("enable_thinking")
+        if enable_thinking is False:
+            logger.info(
+                "[REASONING-DEBUG] reasoning DISABLED via kwargs (enable_thinking=False); no reasoning_effort"
+            )
+        else:
+            logger.info(
+                "[REASONING-DEBUG] no reasoning_effort in kwargs (enable_thinking=%r); using template default",
+                enable_thinking,
+            )
         return target.apply_chat_template(messages, **original_kwargs)
 
     original_value = original_kwargs["reasoning_effort"]
+    # TEMP DEBUG: per-turn reasoning level (requested value)
+    logger.info("[REASONING-DEBUG] requested reasoning_effort=%r (harmony=%s)", original_value, is_harmony)
     if is_harmony:
         mapped = _harmony_effort(original_value)
         if mapped is None:
@@ -111,6 +124,8 @@ def apply_chat_template_with_reasoning_effort_fallback(
 
     normalized = _normalized_input(original_value)
     original_kwargs["reasoning_effort"] = normalized
+    # TEMP DEBUG: value actually passed to the template on first attempt
+    logger.info("[REASONING-DEBUG] using reasoning_effort=%r for template render", normalized)
     try:
         return target.apply_chat_template(messages, **original_kwargs)
     except Exception as original_error:
@@ -128,6 +143,8 @@ def apply_chat_template_with_reasoning_effort_fallback(
                     original_value,
                     candidate,
                 )
+                # TEMP DEBUG: fallback value actually used
+                logger.info("[REASONING-DEBUG] template render succeeded with fallback reasoning_effort=%r", candidate)
                 return rendered
 
         fallback_kwargs = dict(original_kwargs)
@@ -141,4 +158,6 @@ def apply_chat_template_with_reasoning_effort_fallback(
             "Chat template ignored reasoning_effort=%r and used its native default",
             original_value,
         )
+        # TEMP DEBUG: template does not support reasoning_effort at all
+        logger.info("[REASONING-DEBUG] template ignored reasoning_effort; rendered with native default")
         return rendered
